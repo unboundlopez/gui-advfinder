@@ -15,15 +15,51 @@ LType = utils.invert{'None','Local','Site','Wild','Under','Army'} --Location typ
 
 filter_text = filter_text --Stored filter between lists; for setting only!
 --  Use AdvSelWindow:get_filter_text() instead for getting current filter
-cur_tab = cur_tab or 1 -- 1: HF, 2: Artifact
+cur_tab = cur_tab or 1 -- 1: HF, 2: Artifact, 3: Units
 show_dead = show_dead or false --Exclude dead HFs
 show_books = show_books or false --Exclude books
 sel_hf = sel_hf or -1 --Selected historical_figure.id
 sel_art = sel_art or -1 --Selected artifact_record.id
+sel_unit = sel_unit or -1 -- Selected df.unit.id
+
 debug_id = false --Show target ID in window title; reopening without -d option resets
+show_dead_units = show_dead_units or false  -- Include dead units in Units tab
+show_anonymous = show_anonymous or true
+------------------
+--Math & distance
+------------------
 
----- Fns for target names ----
+local function dist2(a, b)
+    if not a or not b or not a.x or not a.y or not b.x or not b.y then return math.huge end
+    return (a.x - b.x)^2 + (a.y - b.y)^2
+end
+------------------
+--Name formatters
+------------------
 
+--- Returns DFHack’s human‐readable name for any unit (alive, dead, or corpse),
+--- prefixing “Anonymous” whenever the underlying personal name is blank.
+local function get_unit_full_name(unit)
+    -- 1) Base: DFHack readable (species or personal)
+    local name = dfhack.units.getReadableName(unit)
+    if name == '' then
+        name = 'Anonymous'
+    end
+
+    -- 2) If no personal name, prefix “Anonymous ”
+    local personal = transName(unit.name, false)
+    if personal == '' or personal:match('^%s*$') then
+        if name ~= 'Anonymous' then
+            name = 'Anonymous ' .. name
+        end
+    end
+
+    return name
+end
+
+---------------------------
+--Functionsfor target names
+---------------------------
 local function get_race_name(hf) --E.g., 'Plump Helmet Man'
     return dfhack.capitalizeStringWords(dfhack.units.getRaceReadableNameById(hf.race))
 end
@@ -31,7 +67,7 @@ end
 function get_hf_name(hf) --'Native Name "Translated Name", Race'
     local full_name = transName(hf.name, false)
     if full_name == '' then --Improve searchability
-        full_name = 'Unnamed'
+        full_name = 'Anonymous'
     else --Add the translation
         local t_name = transName(hf.name, true)
         if full_name ~= t_name then --Don't repeat
@@ -50,7 +86,7 @@ end
 function get_art_name(ar) --'Native Name "Translated Name", Item'
     local full_name = transName(ar.name, false)
     if full_name == '' then --Improve searchability
-        full_name = 'Unnamed'
+        full_name = 'Anonymous'
     else --Add the translation
         local t_name = transName(ar.name, true)
         if full_name ~= t_name then --Don't repeat
@@ -59,33 +95,135 @@ function get_art_name(ar) --'Native Name "Translated Name", Item'
     end
     return full_name..', '..dfhack.items.getDescription(ar.item, 1, true)
 end
+------------------
+--List builders & filters
+------------------
 
-local function build_hf_list() --Build alphabetized HF list
+-- Rebuilds the Units list, now respecting show_anonymous
+
+local function build_unit_list()
+    local adv_unit = dfhack.world.getAdventurer()
+    local adv_id = adv_unit and adv_unit.id or -1
+    local adv_gpos = (get_adv_data() or {}).g_pos
     local t = {}
-    for _,hf in ipairs(world.history.figures) do
-        if show_dead or hf.died_year == -1 then --Filter dead
-            local name = get_hf_name(hf)
-            local str = toSearch(name)
 
-            if hf.died_year ~= -1 then
-                name = {{text=name, pen=COLOR_RED}} --Dead
-            elseif not hf.info or not hf.info.whereabouts then
-                name = {{text=name, pen=COLOR_YELLOW}} --Deity (usually)
-            end
-            table.insert(t, {text=name, id=hf.id, search_key=str})
+    for _, unit in ipairs(world.units.active) do
+        -- Skip the adventurer themself
+        if unit.id == adv_id then
+            goto continue
         end
+
+        -- 1) Determine if this unit is “anonymous” (no personal name)
+        local personal_name = transName(unit.name, false)
+        local is_anonymous  = (personal_name == '')
+
+        -- 2) Skip dead (if toggled off) and anonymous (if toggled off)
+        if (show_dead_units or not dfhack.units.isDead(unit))
+           and (show_anonymous or not is_anonymous)
+        then
+            -- Build the display name (will be “Anonymous” if blank)
+            local display_name = get_unit_full_name(unit)
+
+            -- Prepare search key and distance
+            local str = toSearch(display_name)
+            local pos = xyz2pos(dfhack.units.getPosition(unit))
+            local g_pos = global_from_local(pos)
+            local distance = dist2(adv_gpos, g_pos)
+
+            table.insert(t, {
+                text = display_name,
+                id = unit.id,
+                search_key = str,
+                distance = distance,
+            })
+        end
+        ::continue::
     end
-    table.sort(t, function(a, b) return a.search_key < b.search_key end)
+
+    table.sort(t, function(a, b)
+        if a.distance == b.distance then
+            return a.search_key < b.search_key
+        else
+            return a.distance < b.distance
+        end
+    end)
+
+    return t
+end
+
+local function build_hf_list()
+    local adv_unit = dfhack.world.getAdventurer()
+    local adv_gpos = (get_adv_data() or {}).g_pos
+    local t = {}
+
+    for _, hf in ipairs(world.history.figures) do
+        -- Skip if this HF is the adventurer
+        if adv_unit and hf.unit_id == adv_unit.id then
+            goto continue
+        end
+
+        if (show_dead or hf.died_year == -1) then
+            local personal = transName(hf.name, false)
+            local is_anon = (personal == '' or personal:match('^%s*$'))
+
+            if show_anonymous or not is_anon then
+                -- Name handling
+                local native_full     = personal
+                if native_full == '' then native_full = 'Anonymous' end
+                local translated_full = transName(hf.name, true)
+                if translated_full == '' then translated_full = native_full end
+
+                -- Split names
+                local native_first, native_last = native_full:match('^(%S+)%s+(.+)$')
+                if not native_first then native_first, native_last = native_full, '' end
+                local trans_first, trans_last = translated_full:match('^(%S+)%s+(.+)$')
+                if not trans_first then trans_first, trans_last = translated_full, '' end
+
+                -- Display name
+                local display_name = trans_first
+                if trans_last  ~= '' then display_name = display_name .. ' '  .. trans_last  end
+                if native_last ~= '' then display_name = display_name .. ' "' .. native_last .. '"' end
+
+                -- Race & status
+                local race = dfhack.units.getRaceReadableNameById(hf.race)
+                race = dfhack.capitalizeStringWords(race)
+                if race ~= '' then display_name = display_name .. ', ' .. race end
+                local status = (hf.died_year ~= -1) and 'Dead' or 'Alive'
+                display_name = display_name .. ', ' .. status
+
+                local prof = dfhack.units.getProfessionName(hf) or 'Unknown'
+                display_name = display_name .. ', ' .. prof
+
+                -- Distance
+                local str      = toSearch(display_name)
+                local data     = get_hf_data(hf)
+                local pos      = (data and data.g_pos) or nil
+                local distance = dist2(adv_gpos, pos)
+
+                table.insert(t, {
+                    text       = display_name,
+                    id         = hf.id,
+                    search_key = str,
+                    distance   = distance,
+                })
+            end
+        end
+        ::continue::
+    end
+
+    table.sort(t, function(a, b)
+        if a.distance == b.distance then
+            return a.search_key < b.search_key
+        else
+            return a.distance < b.distance
+        end
+    end)
+
     return t
 end
 
 local function get_id(first, second) --Try to get a numeric id or -1
     return (first >= 0 and first) or (second >= 0 and second) or -1
-end
-
-local function dead_holder(ar) --Return true if has holder and they're dead
-    local holder = df.historical_figure.find(get_id(ar.holder_hf, ar.owner_hf))
-    return holder and holder.died_year ~= -1
 end
 
 local function is_book(ar) --Return true if codex/scroll/quire
@@ -94,21 +232,62 @@ local function is_book(ar) --Return true if codex/scroll/quire
         (item._type == df.item_toolst and item:hasToolUse(df.tool_uses.CONTAIN_WRITING))
 end
 
-local function build_art_list() --Build alphabetized artifact list
+local function build_art_list()
+    local adv_data = get_adv_data() or {}
+    local adv_pos  = adv_data.pos
+    local adv_gpos = adv_data.g_pos
     local t = {}
-    for _,ar in ipairs(world.artifacts.all) do
-        local dead = dead_holder(ar)
-        if (show_dead or not dead) and (show_books or not is_book(ar)) then
-            local name = get_art_name(ar)
-            local str = toSearch(name)
 
-            if dead then
-                name = {{text=name, pen=COLOR_RED}}
+    for _, ar in ipairs(world.artifacts.all) do
+        -- only filter out books if that toggle is off
+        if show_books or not is_book(ar) then
+            -- 1) display & search key
+            local name = get_art_name(ar)
+            local key  = toSearch(name)
+
+            -- 2) raw data
+            local data = get_art_data(ar)
+
+            -- 3) holder override (as before)
+            if data.holder then
+                local hdata = get_hf_data(data.holder)
+                if hdata.pos then
+                    data.pos   = hdata.pos
+                    data.g_pos = global_from_local(hdata.pos)
+                elseif hdata.g_pos then
+                    data.g_pos = hdata.g_pos
+                    data.pos   = nil
+                end
             end
-            table.insert(t, {text=name, id=ar.id, search_key=str})
+
+            -- 4) pick distance (local then global)
+            local dist
+            if adv_pos and data.pos then
+                dist = dist2(adv_pos, data.pos)
+            elseif adv_gpos and data.g_pos then
+                dist = dist2(adv_gpos, data.g_pos)
+            else
+                dist = math.huge
+            end
+
+            table.insert(t, {
+                text       = name,
+                id         = ar.id,
+                search_key = key,
+                distance   = dist,
+            })
         end
     end
-    table.sort(t, function(a, b) return a.search_key < b.search_key end)
+
+    -- 5) sort by distance then name
+    table.sort(t, function(a, b)
+        if a.distance == b.distance then
+            return a.search_key < b.search_key
+        else
+            return a.distance < b.distance
+        end
+    end)
+
     return t
 end
 
@@ -119,65 +298,137 @@ end
 AdvSelWindow = defclass(AdvSelWindow, widgets.Window)
 AdvSelWindow.ATTRS{
     frame_title = 'Find Target',
-    frame = {w=42, h=24, t=22, r=34},
+    frame = {w=90, h=28, t=22, r=34},
     resizable = true,
     visible = false,
 }
 
 function AdvSelWindow:init()
     self:addviews{
+        -- Tab bar at the top
         widgets.TabBar{
-            frame = {t=0},
-            labels = {
-                'Historical Figures',
-                'Artifacts',
-            },
-            on_select = self:callback('swap_tab'),
+            frame = { t=0 },
+            labels = { 'Historical Figures', 'Artifacts', 'Units' },
             get_cur_page = function() return cur_tab end,
+            on_select = self:callback('swap_tab'),
         },
+
+        -- HF list
         widgets.FilteredList{
             view_id = 'sel_hf_list',
-            frame = {t=2, b=2},
+            frame = { t=2, b=2 },
             not_found_label = 'No results',
             edit_key = 'CUSTOM_ALT_S',
             on_submit = self:callback('select_entry'),
-            visible = false, --Handled in sel_list
+            visible = function() return cur_tab == 1 end,
         },
-        widgets.FilteredList{ --setChoices is too slow, don't reuse HF list
+
+        -- Artifact list
+        widgets.FilteredList{
             view_id = 'sel_art_list',
-            frame = {t=2, b=2},
+            frame = { t=2, b=2 },
             not_found_label = 'No results',
             edit_key = 'CUSTOM_ALT_S',
             on_submit = self:callback('select_entry'),
-            visible = false,
+            visible = function() return cur_tab == 2 end,
         },
-        widgets.ToggleHotkeyLabel
-        {
+
+        -- Unit list
+        widgets.FilteredList{
+            view_id = 'sel_unit_list',
+            frame = { t=2, b=2 },
+            not_found_label = 'No results',
+            edit_key = 'CUSTOM_ALT_S',
+            on_submit = self:callback('select_entry'),
+            visible = function() return cur_tab == 3 end,
+        },
+
+        -- Show‐dead toggle (HF tab)
+        widgets.ToggleHotkeyLabel{
             view_id = 'dead_toggle',
-            frame = {b=0, l=0, w=17, h=1},
+            frame = { b=0, l=0,  w=17, h=1 },
             label = 'Show dead:',
             key = 'CUSTOM_SHIFT_D',
             initial_option = show_dead,
             on_change = self:callback('set_show_dead'),
+            visible = function() return cur_tab == 1 end,
         },
-        widgets.ToggleHotkeyLabel
-        {
+
+        -- Show‐anonymous toggle (HF tab)
+        widgets.ToggleHotkeyLabel{
+            view_id = 'hf_anon_toggle',
+            frame = { b=0, l=36, w=19, h=1 },
+            label = 'Show anonymous:',
+            key = 'CUSTOM_SHIFT_A',
+            initial_option = show_anonymous,
+            on_change = self:callback('set_show_anonymous'),
+            visible = function() return cur_tab == 1 end,
+        },
+
+        -- In AdvSelWindow:init(), add a Show‐dead toggle for Units (tab 3):
+        widgets.ToggleHotkeyLabel{
+            view_id = 'unit_dead_toggle',
+            frame = { b=0, r=14, w=17, h=1 },
+            label = 'Show dead:',
+            key = 'CUSTOM_SHIFT_D',
+            initial_option = show_dead_units,
+            on_change = self:callback('set_show_dead_units'),
+            visible = function() return cur_tab == 3 end,
+        },
+
+        -- Show‐books toggle (Artifacts tab)
+        widgets.ToggleHotkeyLabel{
             view_id = 'book_toggle',
-            frame = {b=0, r=0, w=18, h=1},
+            frame = { b=0, r=0,  w=18, h=1 },
             label = 'Show books:',
             key = 'CUSTOM_SHIFT_B',
             initial_option = show_books,
             on_change = self:callback('set_show_books'),
-            visible = function() return cur_tab ~= 1 end,
+            visible = function() return cur_tab == 2 end,
+        },
+        -- **Show‐anonymous toggle (Units tab)**
+        widgets.ToggleHotkeyLabel{
+            view_id = 'anon_toggle',
+            frame = { b=0, l=36, w=19, h=1 },
+            label = 'Show anonymous:',
+            key = 'CUSTOM_SHIFT_A',
+            initial_option = show_anonymous,
+            on_change = self:callback('set_show_anonymous'),
+            visible = function() return cur_tab == 3 end,
+        },
+
+        -- Refresh hotkey (all tabs)
+        widgets.HotkeyLabel{
+            view_id = 'refresh_list',
+            frame = { b=0, l=18, w=18, h=1 },
+            label = 'Refresh',
+            key = 'CUSTOM_CTRL_Z',
+            on_activate = self:callback('refresh_list'),
         },
     }
 end
 
-function AdvSelWindow:get_filter_text() --Get current filter from tab
-    if cur_tab == 1 then --HF
+-- Handler for the “Show anonymous” toggle: flips the flag and rebuilds only the Units list
+function AdvSelWindow:set_show_anonymous(val)
+    show_anonymous = not not val       -- ensure boolean
+    filter_text = self:get_filter_text()
+
+    if cur_tab == 1 then
+        self.subviews.sel_hf_list:setChoices()
+    else
+        self.subviews.sel_unit_list:setChoices()
+    end
+
+    self:sel_list()
+end
+
+function AdvSelWindow:get_filter_text()
+    if cur_tab == 1 then -- HF
         return self.subviews.sel_hf_list:getFilter()
-    else --Artifact
+    elseif cur_tab == 2 then -- Artifact
         return self.subviews.sel_art_list:getFilter()
+    else -- Units
+        return self.subviews.sel_unit_list:getFilter()
     end
 end
 
@@ -189,35 +440,62 @@ function AdvSelWindow:swap_tab(idx) --Persist filter and swap list
     end
 end
 
-function AdvSelWindow:sel_list() --Set correct list for tab
-    local new, old, build_fn
-    if cur_tab == 1 then --HF
+function AdvSelWindow:sel_list()
+    local new, build_fn
+
+    if cur_tab == 1 then -- Historical Figures
         new = self.subviews.sel_hf_list
-        old = self.subviews.sel_art_list
         build_fn = build_hf_list
-    else --Artifact
+    elseif cur_tab == 2 then -- Artifacts
         new = self.subviews.sel_art_list
-        old = self.subviews.sel_hf_list
         build_fn = build_art_list
+    else -- Units
+        new = self.subviews.sel_unit_list
+        build_fn = build_unit_list
     end
 
-    old.visible = false
+    -- Hide all lists before showing the current one
+    self.subviews.sel_hf_list.visible = false
+    self.subviews.sel_art_list.visible = false
+    self.subviews.sel_unit_list.visible = false
+
     new.visible = true
-    if not next(new:getChoices()) then --Empty, build list
+    if not next(new:getChoices()) then
         new:setChoices(build_fn())
     end
-    new:setFilter(filter_text) --Restore filter
-    new.edit:setFocus(old.edit.focus) --Inherit search focus
-    old.edit:setFocus(false)
+    new:setFilter(filter_text)
+    new.edit:setFocus(true)
 end
 
 function AdvSelWindow:select_entry(sel, obj) --Set correct target for tab
     local id = obj and obj.id or -1
-    if cur_tab == 1 then --HF
-        sel_hf, sel_art = id, -1
-    else --Artifact
-        sel_hf, sel_art = -1, id
+    if cur_tab == 1 then
+       sel_hf, sel_art, sel_unit = id, -1, -1
+    elseif cur_tab == 2 then
+        sel_hf, sel_art, sel_unit = -1, id, -1
+    else
+        sel_hf, sel_art, sel_unit = -1, -1, id
     end
+end
+
+function AdvSelWindow:refresh_list()
+    -- preserve current filter
+    local filter = self:get_filter_text()
+
+    -- choose the right list + builder
+    local list, build_fn
+    if cur_tab == 1 then
+        list, build_fn = self.subviews.sel_hf_list, build_hf_list
+    elseif cur_tab == 2 then
+        list, build_fn = self.subviews.sel_art_list, build_art_list
+    else
+        list, build_fn = self.subviews.sel_unit_list, build_unit_list
+    end
+
+    -- rebuild, re-filter, refocus
+    list:setChoices(build_fn())
+    list:setFilter(filter)
+    list.edit:setFocus(true)
 end
 
 function AdvSelWindow:set_show_dead(show) --Set filtering of dead HFs, rebuild list
@@ -243,6 +521,16 @@ function AdvSelWindow:set_show_books(show) --Set filtering of books, rebuild lis
     self:sel_list()
 end
 
+--Units‐tab dead toggle handler here
+function AdvSelWindow:set_show_dead_units(val)
+    val = not not val
+    if val == show_dead_units then return end
+    show_dead_units = val
+    filter_text = self:get_filter_text()
+    self.subviews.sel_unit_list:setChoices()
+    self:sel_list()
+end
+
 function AdvSelWindow:onInput(keys) --Close only this window
     if keys.LEAVESCREEN or keys._MOUSE_R then
         self.visible = false
@@ -253,8 +541,9 @@ function AdvSelWindow:onInput(keys) --Close only this window
     end
     return self.super.onInput(self, keys)
 end
-
----- Fns for getting adventurer data ----
+-------------------------------
+--Coordinate & adventurer data
+-------------------------------
 
 function global_from_local(pos) --Calc global coords (blocks from world origin) from local map pos
     return pos and {x = world.map.region_x*3 + pos.x//16, y = world.map.region_y*3 + pos.y//16} or nil
@@ -272,12 +561,17 @@ function get_adv_data() --All the coords we can get
     return {g_pos = global_from_local(adv.pos), pos = adv.pos}
 end
 
----- Fns for getting target data ----
+----------------------
+--Death & whereabouts 
+----------------------
+
+---- Functions for getting target data ----
 
 local function div(n, d) return n//d, n%d end
 --We can get the MLT coords of a CZ from its ID (e.g., hf.info.whereabouts.cz_id)
 --The g_pos will represent the center of the 3x3 MLT
 --In testing, the HF of interest remained in limbo, but it might be of use to someone
+
 function cz_g_pos(cz_id) --Creation zone center in global coords
     if not cz_id or cz_id < 0 then return nil end
     local w, t, rem = world.world_data.world_width, {}, nil
@@ -347,6 +641,20 @@ local function get_whereabouts(hf) --Return state profile data
         return {site = w.site_id, sr = w.subregion_id, layer = w.feature_layer_id, army = w.army_id, g_pos = g_pos}
     end
     return {site = -1, sr = -1, layer = -1, army = -1}
+end
+------------------------
+--Target data extractors
+------------------------
+
+function get_unit_data(unit)
+    if not unit then return nil end
+    local pos = xyz2pos(dfhack.units.getPosition(unit))
+    pos = pos.x >= 0 and pos or nil
+    return {
+        loc_type = LType.Local,
+        g_pos = global_from_local(pos),
+        pos = pos
+    }
 end
 
 function get_hf_data(hf) --Locational data and coords
@@ -448,8 +756,102 @@ function get_art_data(ar) --Locational data and coords
     data.g_pos = data.g_pos or g_pos or nil --Try our own if no holder g_pos
     return data --Probably in limbo
 end
+--------------
+--Pathing hook
+--------------
 
----- Fns for adventurer info panel ----
+-- teleporting to the target
+
+local function teleport_to_target()
+    -- 1) Grab your army record
+    local my_army_id = df.global.adventure.player_army_id
+    local my_army    = df.army.find(my_army_id)
+    if not my_army then
+        dfhack.gui.showPopupAnnouncement(
+            "[FF0000]Error: Player army not found. You must first be in map mode and move at least one tile."
+        )
+        return
+    end
+
+    -- 2) Fetch the selected target’s data
+    local target_data
+    if sel_hf  and sel_hf  >= 0 then
+        target_data = get_hf_data(df.historical_figure.find(sel_hf))
+    elseif sel_art and sel_art >= 0 then
+        target_data = get_art_data(df.artifact_record.find(sel_art))
+    elseif sel_unit and sel_unit >= 0 then
+        target_data = get_unit_data(df.unit.find(sel_unit))
+    end
+    if not target_data then
+        dfhack.gui.showPopupAnnouncement("[FF0000]Error: No target selected.")
+        return
+    end
+
+    -- 3) Determine block‐coords (g_pos) for the target
+    local block_pos = target_data.g_pos
+    if not block_pos then
+        if target_data.pos then
+            block_pos = global_from_local(target_data.pos)
+        else
+            dfhack.gui.showPopupAnnouncement("[FF0000]Error: Target has no valid position data.")
+            return
+        end
+    end
+
+    -- 4) Clamp into int16 range
+    local function clamp_i16(v)
+        if type(v) ~= 'number' then return 0 end
+        if v < -32768 then return -32768 end
+        if v >  32767 then return  32767 end
+        return v
+    end
+    local bx = clamp_i16(block_pos.x)
+    local by = clamp_i16(block_pos.y)
+
+    -- 5) Apply to your army
+    my_army.pos.x = bx
+    my_army.pos.y = by
+
+    -- 6) Check alignment and announce
+    if my_army.pos.x == block_pos.x and my_army.pos.y == block_pos.y then
+        dfhack.gui.showPopupAnnouncement("[00FF00]You have arrived at the target.")
+    else
+        dfhack.gui.showPopupAnnouncement("[FF0000]More teleports required.")
+    end
+end
+
+
+function begin_auto_pathing()
+    local you = df.global.world.units.adv_unit
+    if not (you and you.path and you.path.dest) then return end
+
+    local pos
+    if sel_hf >= 0 then
+        local hf = df.historical_figure.find(sel_hf)
+        local data = get_hf_data(hf)
+        pos = data and (data.pos or data.g_pos)
+    elseif sel_art >= 0 then
+        local art = df.artifact_record.find(sel_art)
+        local data = get_art_data(art)
+        pos = data and (data.pos or data.g_pos)
+    elseif sel_unit >= 0 then
+        local unit = df.unit.find(sel_unit)
+        local data = get_unit_data(unit)
+        pos = data and (data.pos or data.g_pos)
+    end
+
+    if pos and pos.x and pos.y and pos.z then
+        you.path.dest.x = pos.x
+        you.path.dest.y = pos.y
+        you.path.dest.z = pos.z
+        you.path.goal = 215
+    end
+end
+---------------------------------
+--Text-layout & compass utilities
+---------------------------------
+
+---- Functions for adventurer info panel ----
 
 local compass_dir = {
     'E','ENE','NE','NNE',
@@ -522,6 +924,9 @@ local function pos_text(t, g_pos, pos) --Add available coords
         table.insert(t, NEWLINE)
     end
 end
+-----------------------
+--Panel text generators
+-----------------------
 
 local function adv_text(adv_data, target_data) --Text for adv info panel
     if not adv_data then
@@ -534,67 +939,105 @@ local function adv_text(adv_data, target_data) --Text for adv info panel
     return t
 end
 
----- Fns for target info panel ----
+-- Simplified unit_text: name, status, race, coords – no professions
+local function unit_text(unit, target_data)
+    if not unit or not target_data then return '' end
+    local t = {}
 
-local function insert_name_text(t, name) --HF or artifact name; Return true if both lines
-    local str = transName(name, false)
-    if str == '' then
-        table.insert(t, 'Unnamed')
-    else --Both native and translation
-        table.insert(t, str) --Native
-        local t_name = transName(name, true)
-        if str ~= t_name then --Don't repeat
-            insert_text(t, '"'..t_name..'"')
-            return true
-        end
+    -- 1) First line: just the name
+    local name = dfhack.units.getReadableName(unit)
+    table.insert(t, name)
+
+    -- 2) Alive/Dead status
+    if not dfhack.units.isDead(unit) then
+        insert_text(t, { text='ALIVE', pen=COLOR_LIGHTGREEN })
+    else
+        insert_text(t, { text='DEAD',  pen=COLOR_RED })
     end
+
+    -- 3) Race
+    insert_text(t, get_race_name(unit))
+
+    -- 4) Position info (global/local compass, etc.)
+    pos_text(t, target_data.g_pos, target_data.pos)
+
+    return t
 end
 
-local function hf_text(hf, target_data) --HF text for target info panel
-    if not hf or not target_data then --No target
+---- Functions for target info panel ----
+
+local function insert_name_text(t, name)
+    -- Insert a single line containing native and translated names together
+    local native = transName(name, false)
+    if native == '' then
+        native = 'Anonymous'
+    end
+    local translated = transName(name, true)
+    -- Build full display name: native plus translation in quotes if different
+    local full = native
+    if translated ~= '' and translated ~= native then
+        full = full .. ' "' .. translated .. '"'
+    end
+    table.insert(t, full)
+    -- no return: default nil indicates single-line insertion
+end
+
+-- Simplified HF info‐panel text: prefer getReadableName when loaded
+local function hf_text(hf, target_data)
+    if not hf or not target_data then
         return ''
     end
-    local t = {} --Native, [translated], race, alive, location, global, local
 
-    local both_lines = insert_name_text(t, hf.name)
-    local str = get_race_name(hf)
-    insert_text(t, str ~= '' and str or 'Force')
-    if not both_lines then --Consistent spacing
-        table.insert(t, NEWLINE)
+    local t = {}
+
+    -- 1) Name: prefer readable if unit is loaded
+    local display_name
+    if hf.unit_id and hf.unit_id >= 0 then
+        local u = df.unit.find(hf.unit_id)
+        if u and not dfhack.units.isDead(u) then
+            display_name = dfhack.units.getReadableName(u)
+        end
     end
+    if not display_name then
+        display_name = transName(hf.name, false)
+        if display_name == '' then display_name = 'Anonymous' end
+    end
+    table.insert(t, display_name)
 
-    local eternal --Can't reasonably die
+    -- 2) Race
+    local race = get_race_name(hf)
+    insert_text(t, race ~= '' and race or 'Force')
+
+    -- 3) Alive/Dead or Eternal/Missing
     if hf.died_year ~= -1 then
         insert_text(t, {text='DEAD', pen=COLOR_RED})
     elseif hf.old_year == -1 and target_data.loc_type == LType.None then
-        eternal = true --In limbo and can't reasonably die
         insert_text(t, {text='ETERNAL', pen=COLOR_LIGHTBLUE})
     else
         insert_text(t, {text='ALIVE', pen=COLOR_LIGHTGREEN})
     end
 
-    if target_data.loc_type == LType.None then --Everywhere or nowhere
-        if eternal then
-            insert_text(t, {text='Transcendent', pen=COLOR_YELLOW})
-        else
-            insert_text(t, {text='Missing', pen=COLOR_MAGENTA})
-        end
-    else --Physical location
-        if target_data.loc_type == LType.Local then
-            insert_text(t, 'Nearby')
-        elseif target_data.loc_type == LType.Site then
-            insert_text(t, {text='At '..transName(target_data.site.name, true), pen=COLOR_LIGHTBLUE})
-        elseif target_data.loc_type == LType.Army then
-            insert_text(t, {text='Traveling', pen=COLOR_LIGHTBLUE})
-        elseif target_data.loc_type == LType.Wild then
-            insert_text(t, {text='Wilderness ('..transName(target_data.sr.name, true)..')', pen=COLOR_LIGHTRED})
-        elseif target_data.loc_type == LType.Under then
-            insert_text(t, {text='Underground', pen=COLOR_LIGHTRED})
-        else --Undefined loc_type
-            insert_text(t, {text='Error', pen=COLOR_MAGENTA})
-        end
+    -- 4) Location descriptor
+    if target_data.loc_type == LType.None then
+        local label = (hf.died_year ~= -1) and 'Missing' or 'Transcendent'
+        insert_text(t, {text=label, pen=COLOR_MAGENTA})
+    elseif target_data.loc_type == LType.Local then
+        insert_text(t, 'Nearby')
+    elseif target_data.loc_type == LType.Site then
+        insert_text(t, {text='At '..transName(target_data.site.name, true), pen=COLOR_LIGHTBLUE})
+    elseif target_data.loc_type == LType.Army then
+        insert_text(t, {text='Traveling', pen=COLOR_LIGHTBLUE})
+    elseif target_data.loc_type == LType.Wild then
+        insert_text(t, {text='Wilderness ('..transName(target_data.sr.name, true)..')', pen=COLOR_LIGHTRED})
+    elseif target_data.loc_type == LType.Under then
+        insert_text(t, {text='Underground', pen=COLOR_LIGHTRED})
+    else
+        insert_text(t, {text='Error', pen=COLOR_MAGENTA})
     end
+
+    -- 5) Coordinates
     pos_text(t, target_data.g_pos, target_data.pos)
+
     return t
 end
 
@@ -635,7 +1078,6 @@ local function art_text(art, target_data) --Artifact text for target info panel
     pos_text(t, target_data.g_pos, target_data.pos)
     return t
 end
-
 -------------------
 -- AdvFindWindow --
 -------------------
@@ -643,7 +1085,7 @@ end
 AdvFindWindow = defclass(AdvFindWindow, widgets.Window)
 AdvFindWindow.ATTRS{
     frame_title = 'Finder',
-    frame = {w=30, h=24, t=22, r=2},
+    frame = {w=31, h=30, t=22, r=2},
     resizable = true,
 }
 
@@ -663,7 +1105,7 @@ function AdvFindWindow:init()
         },
         widgets.Panel{
             view_id = 'target_panel',
-            frame = {t=11},
+            frame = {t=11, h=9},
             frame_style = gui.FRAME_INTERIOR,
             subviews = {
                 widgets.Label{
@@ -673,64 +1115,139 @@ function AdvFindWindow:init()
                 },
             },
         },
+-- Auto Path Panel (renamed from extra_panel)
+widgets.Panel{
+    view_id = 'path_panel',
+    frame = {t=20, h=3},
+    frame_style = gui.FRAME_INTERIOR,
+    subviews = {
+        widgets.HotkeyLabel{
+            view_id     = 'path_button',
+            label       = 'Auto Path',
+            key         = 'CUSTOM_CTRL_P',
+            auto_width  = true,
+            frame       = {l=1},
+            on_activate = begin_auto_pathing,
+        },
+    },
+},
+
+-- New Teleport Panel
+widgets.Panel{
+    view_id = 'teleport_panel',
+    frame = {t=23, h=3},
+    frame_style = gui.FRAME_INTERIOR,
+    subviews = {
+        widgets.HotkeyLabel{
+            view_id     = 'teleport_button',
+            label       = 'Port to Target',
+            key         = 'CUSTOM_CTRL_T',
+            auto_width  = true,
+            frame       = {l=1},
+on_activate = function()
+    local ok, err = pcall(teleport_to_target)
+    if not ok then
+        dfhack.printerr("Teleport failed: " .. tostring(err))
+    end
+end,
+        },
+    },
+},
+
+
         widgets.ConfigureButton{
             frame = {t=0, r=0},
             on_click = function()
-                local sel_window = view.subviews[2] --AdvSelWindow
+                local sel_window = view.subviews[2]
                 sel_window.visible = true
                 sel_window:sel_list()
             end,
-        }
+        },
     }
 end
 
-local function set_title(self) --Display target ID in title
+local function set_title(self)
     if debug_id then
-        local id = get_id(sel_hf, sel_art)
+        local id = get_id(sel_hf, get_id(sel_art, sel_unit))
         self.frame_title = 'Finder'..(id ~= -1 and ' (#'..id..')' or '')
     else
         self.frame_title = 'Finder'
     end
 end
 
+
 function AdvFindWindow:onRenderFrame(dc, rect)
-    if not dfhack.world.isAdventureMode() then --Could be advfort, etc.
+    if not dfhack.world.isAdventureMode() then
         view:dismiss()
         print('gui/adv-finder: lost adv mode, dismissing view')
     end
     self.super.onRenderFrame(self, dc, rect)
 
-    local adv_panel = self.subviews.adv_panel
+    local adv_panel    = self.subviews.adv_panel
     local target_panel = self.subviews.target_panel
-
     local target_data
-    if sel_hf >= 0 then --HF
+
+    if sel_hf >= 0 then
+        -- Historical Figure
         local target_hf = findHF(sel_hf)
         target_data = get_hf_data(target_hf)
-        target_panel.subviews.target_label:setText(hf_text(target_hf, target_data))
-    elseif sel_art >= 0 then --Artifact
+        target_panel.subviews.target_label:setText(
+            hf_text(target_hf, target_data)
+        )
+
+    elseif sel_art >= 0 then
+        -- Artifact (with fixed holder‐position override)
         local target_art = df.artifact_record.find(sel_art)
-        target_data = get_art_data(target_art)
-        target_panel.subviews.target_label:setText(art_text(target_art, target_data))
-    else --None
+        local data       = get_art_data(target_art)
+
+        if data.holder then
+            local hdata = get_hf_data(data.holder)
+            if hdata.pos then
+                -- holder is actually loaded → use exact tile coords for local
+                data.pos   = hdata.pos
+                data.g_pos = global_from_local(hdata.pos)
+            elseif hdata.g_pos then
+                -- fallback to block coords
+                data.g_pos = hdata.g_pos
+                data.pos   = nil
+            end
+        end
+
+        target_data = data
+        target_panel.subviews.target_label:setText(
+            art_text(target_art, target_data)
+        )
+
+    elseif sel_unit >= 0 then
+        -- Unit
+        local unit = df.unit.find(sel_unit)
+        target_data = get_unit_data(unit)
+        target_panel.subviews.target_label:setText(
+            unit_text(unit, target_data)
+        )
+
+    else
+        -- Nothing selected
         target_panel.subviews.target_label:setText()
     end
-    adv_panel.subviews.adv_label:setText(adv_text(get_adv_data(), target_data))
+
+    -- Adventurer panel: will now pick up data.pos if set, else use data.g_pos
+    adv_panel.subviews.adv_label:setText(
+        adv_text(get_adv_data(), target_data)
+    )
 
     adv_panel:updateLayout()
     target_panel:updateLayout()
     set_title(self)
 end
 
--------------------
--- AdvFindScreen --
--------------------
-
 AdvFindScreen = defclass(AdvFindScreen, gui.ZScreen)
 AdvFindScreen.ATTRS{
     focus_path = 'advfinder',
 }
-
+---------------
+--AdvFindScreen
+---------------
 function AdvFindScreen:init()
     self:addviews{AdvFindWindow{}, AdvSelWindow{}}
 end
@@ -746,6 +1263,9 @@ end
 if not dfhack.world.isAdventureMode() then
     qerror('Adventure mode only!')
 end
+------------------------------------
+--Event-handler & argparse callbacks
+------------------------------------
 
 dfhack.onStateChange['adv-finder'] = function(sc)
     if sc == SC_WORLD_UNLOADED then --Data is world-specific
